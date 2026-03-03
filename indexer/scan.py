@@ -1,0 +1,202 @@
+from __future__ import annotations
+
+import argparse
+import os
+import re
+from pathlib import Path
+from typing import Dict, Iterable, List, Tuple
+
+from .db import FootageDatabase, FootageRecord, open_default_db
+
+
+SUPPORTED_EXTENSIONS = {".mov", ".mp4", ".exr", ".dpx", ".jpg", ".png"}
+IGNORE_FOLDERS = ["_trash", "backup", "temp", ".git", "__pycache__"]
+
+SEQUENCE_REGEX = re.compile(r"^(?P<prefix>.*?)(?P<frame>\d{4})\.(?P<ext>exr|dpx)$", re.IGNORECASE)
+
+AUTO_CATEGORY_RULES: Dict[str, str] = {
+    "muzzle": "Muzzle",
+    "smoke": "Smoke",
+    "fire": "Fire",
+    "blood": "Blood",
+    "sparks": "Sparks",
+    "dust": "Dust",
+    "hit": "Hits",
+    "hits": "Hits",
+    "explosion": "Explosion",
+    "explosions": "Explosion",
+    "lightning": "Lightning",
+}
+
+
+def _compute_asset_type_for_single(ext: str) -> str:
+    if ext in (".mov", ".mp4"):
+        return "video"
+    if ext in (".jpg", ".png", ".exr", ".dpx"):
+        return "image"
+    return "unknown"
+
+
+def scan_directory(root: Path) -> Iterable[FootageRecord]:
+    root = root.resolve()
+    for dirpath, dirnames, filenames in os.walk(root):
+        # Exclude ignored folders from recursion
+        dirnames[:] = [d for d in dirnames if d not in IGNORE_FOLDERS]
+
+        folder_path = Path(dirpath)
+        folder_lower = str(folder_path).lower()
+
+        # key: (prefix, ext) -> list of (frame_number, full_path, size)
+        sequence_groups: Dict[Tuple[str, str], List[Tuple[int, Path, int]]] = {}
+        single_records: List[FootageRecord] = []
+
+        for filename in filenames:
+            ext = Path(filename).suffix.lower()
+            if ext not in SUPPORTED_EXTENSIONS:
+                continue
+
+            full_path = folder_path / filename
+            try:
+                size = full_path.stat().st_size
+            except OSError:
+                continue
+
+            if ext in (".exr", ".dpx"):
+                match = SEQUENCE_REGEX.match(filename)
+                if match:
+                    prefix = match.group("prefix")
+                    frame_str = match.group("frame")
+                    try:
+                        frame_num = int(frame_str)
+                    except ValueError:
+                        frame_num = 0
+                    key = (prefix, ext)
+                    sequence_groups.setdefault(key, []).append((frame_num, full_path, size))
+                    continue
+
+            # Non-sequence or non-matching files are treated as single assets
+            asset_type = _compute_asset_type_for_single(ext)
+
+            category = None
+            for key, value in AUTO_CATEGORY_RULES.items():
+                if key in folder_lower:
+                    category = value
+                    break
+
+            single_records.append(
+                FootageRecord(
+                    id=None,
+                    path=str(full_path),
+                    name=full_path.name,
+                    folder=str(folder_path),
+                    extension=ext,
+                    size=size,
+                    asset_type=asset_type,
+                    is_sequence=0,
+                    sequence_pattern=None,
+                    frame_start=None,
+                    frame_end=None,
+                    category=category,
+                )
+            )
+
+        # Yield single (non-sequence) assets
+        for record in single_records:
+            yield record
+
+        # Yield grouped sequences
+        for (prefix, ext), frames in sequence_groups.items():
+            if not frames:
+                continue
+
+            frames.sort(key=lambda x: x[0])
+            frame_numbers = [f[0] for f in frames]
+            frame_start = min(frame_numbers)
+            frame_end = max(frame_numbers)
+
+            pattern = f"{prefix}%04d{ext}"
+            sequence_path = folder_path / pattern
+
+            # Auto category for sequences based on folder path
+            category = None
+            for key, value in AUTO_CATEGORY_RULES.items():
+                if key in folder_lower:
+                    category = value
+                    break
+
+            # Use first frame as representative size
+            first_frame_num, first_path, first_size = frames[0]
+
+            yield FootageRecord(
+                id=None,
+                path=str(sequence_path),
+                name=pattern,
+                folder=str(folder_path),
+                extension=ext,
+                size=first_size,
+                asset_type="sequence",
+                is_sequence=1,
+                sequence_pattern=pattern,
+                frame_start=frame_start,
+                frame_end=frame_end,
+                category=category,
+            )
+
+
+def run_indexer(folders: List[Path], db: FootageDatabase | None = None) -> None:
+    if db is None:
+        db = open_default_db()
+        should_close = True
+    else:
+        should_close = False
+
+    try:
+        all_records: List[FootageRecord] = []
+        for folder in folders:
+            all_records.extend(list(scan_directory(folder)))
+
+        paths = [r.path for r in all_records]
+        existing_paths = db.get_existing_paths(paths)
+        existing_count = sum(1 for r in all_records if r.path in existing_paths)
+        new_count = len(all_records) - existing_count
+
+        db.insert_or_replace_many(all_records)
+
+        print(f"Всего найдено файлов: {len(all_records)}")
+        print(f"Добавлено новых: {new_count}")
+        print(f"Уже существовало (обновлено): {existing_count}")
+    finally:
+        if should_close:
+            db.close()
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Rekursivnyy skaner fytazhey i indeksator v SQLite."
+    )
+    parser.add_argument(
+        "folders",
+        type=str,
+        nargs="+",
+        help="Kornevye papki dlya skanirovaniya (1 ili bolshe).",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    folders: List[Path] = []
+    for folder_str in args.folders:
+        folder = Path(folder_str)
+        if not folder.exists() or not folder.is_dir():
+            raise SystemExit(
+                f"Folder ne naydena ili ne yavlyaetsya direktoriyey: {folder}"
+            )
+        folders.append(folder)
+
+    run_indexer(folders)
+
+
+if __name__ == "__main__":
+    main()
+
