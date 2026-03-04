@@ -56,7 +56,20 @@ class FootageDatabase:
         )
         cur.execute("CREATE INDEX IF NOT EXISTS idx_footage_name ON footage(name)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_footage_folder ON footage(folder)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_footage_category ON footage(category)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_footage_asset_type ON footage(asset_type)")
         self._conn.commit()
+
+        # Ensure category_locked column exists even in pre-existing databases
+        cur.execute("PRAGMA table_info(footage)")
+        columns = [row[1] for row in cur.fetchall()]
+        if "category_locked" not in columns:
+            cur.execute(
+                "ALTER TABLE footage ADD COLUMN category_locked INTEGER NOT NULL DEFAULT 0"
+            )
+            self._conn.commit()
+
+        print("Schema ensured")
 
         # Ensure all expected columns exist on already created tables
         cur.execute("PRAGMA table_info(footage)")
@@ -190,6 +203,45 @@ class FootageDatabase:
             )
             for row in rows
         ]
+
+    def get_all_categories(self) -> List[str]:
+        """
+        Return distinct non-null categories sorted alphabetically.
+        """
+        cur = self._conn.cursor()
+        cur.execute(
+            """
+            SELECT DISTINCT category
+            FROM footage
+            WHERE category IS NOT NULL AND category != ''
+            ORDER BY category ASC
+            """
+        )
+        rows = cur.fetchall()
+        return [row[0] for row in rows]
+
+    def update_category_by_id(self, footage_id: int, new_category: str) -> None:
+        """
+        Manually update category for a single asset (by id)
+        and lock it from automatic changes.
+        """
+        cur = self._conn.cursor()
+        cur.execute(
+            """
+            UPDATE footage
+            SET category = ?, category_locked = 1
+            WHERE id = ?
+            """,
+            (new_category, footage_id),
+        )
+
+        row = self._conn.execute(
+            "SELECT id, category, category_locked FROM footage WHERE id = ?",
+            (footage_id,),
+        ).fetchone()
+        print("AFTER UPDATE ROW:", row)
+
+        self._conn.commit()
 
     def close(self) -> None:
         self._conn.close()

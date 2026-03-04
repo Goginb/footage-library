@@ -151,18 +151,36 @@ def run_indexer(folders: List[Path], db: FootageDatabase | None = None) -> None:
         should_close = False
 
     try:
-        all_records: List[FootageRecord] = []
+        batch: List[FootageRecord] = []
+        BATCH_SIZE = 1000
+        total_count = 0
+        existing_count = 0
+        new_count = 0
+
+        def flush_batch(records: List[FootageRecord]) -> None:
+            nonlocal total_count, existing_count, new_count
+            if not records:
+                return
+            paths = [r.path for r in records]
+            existing_paths = db.get_existing_paths(paths)
+            existing_batch = sum(1 for r in records if r.path in existing_paths)
+            existing_count += existing_batch
+            new_count += len(records) - existing_batch
+            total_count += len(records)
+            db.insert_or_replace_many(records)
+
         for folder in folders:
-            all_records.extend(list(scan_directory(folder)))
+            for record in scan_directory(folder):
+                batch.append(record)
+                if len(batch) >= BATCH_SIZE:
+                    flush_batch(batch)
+                    batch.clear()
 
-        paths = [r.path for r in all_records]
-        existing_paths = db.get_existing_paths(paths)
-        existing_count = sum(1 for r in all_records if r.path in existing_paths)
-        new_count = len(all_records) - existing_count
+        if batch:
+            flush_batch(batch)
+            batch.clear()
 
-        db.insert_or_replace_many(all_records)
-
-        print(f"Всего найдено файлов: {len(all_records)}")
+        print(f"Всего найдено файлов: {total_count}")
         print(f"Добавлено новых: {new_count}")
         print(f"Уже существовало (обновлено): {existing_count}")
     finally:
