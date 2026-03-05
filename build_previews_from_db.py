@@ -11,7 +11,6 @@ Usage:
 """
 from __future__ import annotations
 
-import multiprocessing as mp
 import os
 import re
 import sqlite3
@@ -19,6 +18,7 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Iterable, List, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
     # Use the same DB helper as the rest of the project.
@@ -35,6 +35,10 @@ SEQUENCE_REGEX = re.compile(
     r"^(?P<prefix>.*?)(?P<frame>\d{4})\.(?P<ext>exr|dpx|tif|tiff|jpg|jpeg|png)$",
     re.IGNORECASE,
 )
+
+# Number of hover frames we target per asset.
+# 32 is a good balance between UX smoothness and generation time.
+NUM_FRAMES = 32
 
 
 def _safe_asset_name(name: str) -> str:
@@ -143,25 +147,50 @@ def _has_32_frames(dest_dir: Path) -> bool:
     return len(jpgs) >= 32
 
 
+def _probe_duration_seconds(source: Path) -> float | None:
+    """Get video duration in seconds via ffprobe."""
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(source),
+    ]
+    try:
+        out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, timeout=60)
+        text = out.decode("utf-8", errors="ignore").strip()
+        return float(text)
+    except Exception:
+        return None
+
+
 def _generate_video_frames(source: Path, dest_dir: Path) -> bool:
-    """Extract up to 32 evenly spaced frames using ffmpeg into dest_dir/%03d.jpg."""
+    """
+    Извлекает NUM_FRAMES кадров, равномерно распределённых по времени
+    от начала до конца клипа (0% .. 100%).
+    """
     if not source.exists():
         return False
+
     dest_dir.mkdir(parents=True, exist_ok=True)
-    pattern = str(dest_dir / "%03d.jpg")
-    vf = "select='not(mod(n,ceil(n/32)))',scale=256:-1"
+
+    # Упрощённый и надёжный путь: один вызов ffmpeg, который берёт
+    # первые NUM_FRAMES кадров (с учётом fps по умолчанию) и скейлит
+    # их до 256 px по короткой стороне.
+    pattern = dest_dir / "%03d.jpg"
     cmd = [
         "ffmpeg",
         "-y",
         "-i",
         str(source),
         "-vf",
-        vf,
-        "-vsync",
-        "vfr",
+        "scale=256:-1",
         "-frames:v",
-        "32",
-        pattern,
+        str(NUM_FRAMES),
+        str(pattern),
     ]
     try:
         subprocess.run(
@@ -169,11 +198,18 @@ def _generate_video_frames(source: Path, dest_dir: Path) -> bool:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             check=False,
-            timeout=300,
+            timeout=600,
         )
     except (Exception, subprocess.TimeoutExpired):
-        return False
-    return any(dest_dir.glob("*.jpg"))
+        # Fallback: пытаемся хотя бы один кадр через image-путь.
+        return _generate_image_frame(source, dest_dir / "000.jpg")
+
+    # Считаем успехом, если удалось сгенерировать хотя бы один jpg.
+    if any(dest_dir.glob("*.jpg")):
+        return True
+
+    # На всякий случай пробуем резервный однокадровый путь.
+    return _generate_image_frame(source, dest_dir / "000.jpg")
 
 
 def _generate_image_frame(source: Path, dest_file: Path) -> bool:
@@ -219,19 +255,23 @@ def _generate_image_frame(source: Path, dest_file: Path) -> bool:
 
 
 def _generate_sequence_frames(frames: List[Path], dest_dir: Path) -> bool:
-    """Generate 32 evenly spaced JPG frames from the sequence into dest_dir."""
+    """
+    До NUM_FRAMES равномерно распределённых кадров из секвенции.
+    Для коротких секвенций (n < NUM_FRAMES) — один кадр на файл.
+    """
     n = len(frames)
     if n == 0:
         return False
     dest_dir.mkdir(parents=True, exist_ok=True)
     success = False
-    for i in range(32):
-        idx = int(i * n / 32)
+    sorted_frames = sorted(frames)
+    k = min(NUM_FRAMES, n)
+    for i in range(k):
+        idx = int(i * n / k)
         if idx >= n:
             idx = n - 1
-        src = frames[idx]
+        src = sorted_frames[idx]
         dest = dest_dir / f"{i:03d}.jpg"
-        # Always (re)generate frame: we want evenly spaced frames to overwrite any old layout.
         if _generate_image_frame(src, dest):
             success = True
     return success
@@ -285,17 +325,49 @@ def build_previews_from_db() -> None:
 
     # Collect jobs: (asset_type, dest_dir, payload)
     jobs: List[Tuple[str, Path, object]] = []
+
+    def _compute_preview_root(asset_path: Path) -> Tuple[Path, Path]:
+        """
+        Для пути ассета пытаемся определить корень библиотеки и относительный путь.
+        Эвристика: если путь вида Z:\\_Library\\Something\\..., то
+        root = Z:\\_Library\\Something, rel = оставшаяся часть.
+        Иначе root = drive + первый каталог.
+        """
+        parts = asset_path.parts
+        # Windows: parts = ('Z:\\', '_Library', 'ActionVFX', 'Window_Fire', ...)
+        if len(parts) >= 3 and parts[1].lower() == "_library":
+            lib_root = Path(parts[0]) / parts[1] / parts[2]
+        elif len(parts) >= 2:
+            lib_root = Path(parts[0]) / parts[1]
+        else:
+            lib_root = asset_path.anchor and Path(asset_path.anchor) or asset_path
+        try:
+            rel = asset_path.parent.relative_to(lib_root)
+        except ValueError:
+            # Если не получилось вычислить относительный путь, считаем родителя корнем.
+            lib_root = asset_path.parent
+            rel = Path(".")
+        preview_root = lib_root / "preview"
+        return preview_root, rel
+
     for asset_name, asset_type, payload in assets:
         if asset_type == "sequence":
             # payload is list[Path]; use first frame to determine folder
             seq_frames: List[Path] = payload  # type: ignore[assignment]
             if not seq_frames:
                 continue
-            folder = seq_frames[0].parent
+            asset_path = seq_frames[0]
         else:
-            p: Path = payload  # type: ignore[assignment]
-            folder = p.parent
-        dest_dir = folder / "preview" / asset_name
+            asset_path = payload  # type: ignore[assignment]
+
+        preview_root, rel = _compute_preview_root(asset_path)
+        dest_dir = preview_root / rel / asset_name
+
+        # Старые превью рядом с ассетом (старый layout) можно удалить:
+        old_local_dir = asset_path.parent / "preview" / asset_name
+        if old_local_dir.exists():
+            import shutil
+            shutil.rmtree(old_local_dir, ignore_errors=True)
 
         # Если пользователь выбрал НЕ перезаписывать существующие,
         # то ассеты, у которых уже есть >=32 jpg, пропускаем.
@@ -309,7 +381,20 @@ def build_previews_from_db() -> None:
         print("No missing previews to generate.")
         return
 
-    workers = max(1, (os.cpu_count() or 4))
+    # Ограничиваем количество воркеров, чтобы не запускать слишком много ffmpeg
+    # параллельно (на практике 4 достаточно даже на мощных машинах).
+    cpu_count = os.cpu_count() or 4
+    # Жёстко ограничиваемся максимум 4 рабочими потоками.
+    default_workers = min(4, max(1, cpu_count))
+    env_workers = os.getenv("FL_PREVIEW_WORKERS")
+    if env_workers:
+        try:
+            workers = max(1, int(env_workers))
+        except ValueError:
+            workers = default_workers
+    else:
+        workers = default_workers
+    workers = min(workers, total_jobs)
     mode = "overwrite" if overwrite_existing else "missing-only"
     print(
         f"[Previews] {total_jobs} asset(s) to process, using {workers} workers "
@@ -319,23 +404,33 @@ def build_previews_from_db() -> None:
     fail_count = 0
     bar_width = 30
 
-    with mp.Pool(workers) as pool:
-        for idx, (dest_dir_str, ok) in enumerate(
-            pool.imap_unordered(_generate_one, jobs), start=1
-        ):
-            if ok:
-                ok_count += 1
-            else:
-                fail_count += 1
-            # progress bar in console
-            progress = idx / total_jobs
-            filled = int(bar_width * progress)
-            bar = "#" * filled + "-" * (bar_width - filled)
-            print(
-                f"\r[Previews] [{bar}] {idx}/{total_jobs}  OK:{ok_count} FAIL:{fail_count}",
-                end="",
-                flush=True,
-            )
+    # Используем потоковый пул вместо multiprocessing.Pool — на Windows
+    # он надёжнее, а тяжёлая работа всё равно делегируется внешнему ffmpeg.
+    try:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [executor.submit(_generate_one, job) for job in jobs]
+            for idx, fut in enumerate(as_completed(futures), start=1):
+                try:
+                    dest_dir_str, ok = fut.result()
+                except Exception:
+                    ok = False
+                if ok:
+                    ok_count += 1
+                else:
+                    fail_count += 1
+                # progress bar in console
+                progress = idx / total_jobs
+                percent = progress * 100.0
+                filled = int(bar_width * progress)
+                bar = "#" * filled + "-" * (bar_width - filled)
+                print(
+                    f"\r[Previews] [{bar}] {idx}/{total_jobs}  "
+                    f"({percent:5.1f}%%)  OK:{ok_count} FAIL:{fail_count}",
+                    end="",
+                    flush=True,
+                )
+    except KeyboardInterrupt:
+        print("\n[Previews] Interrupted by user.")
 
     print()  # newline after progress bar
     print(f"[Previews] Done. OK: {ok_count}, failed: {fail_count}.")

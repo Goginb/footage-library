@@ -53,25 +53,54 @@ def find_preview_for_asset(asset_path: str) -> str | None:
 
 def get_preview_dir_for_asset(asset_path: str) -> Path | None:
     """
-    Return directory preview/<asset_name>/ containing 000.jpg..031.jpg
-    (or legacy thumb.jpg). Used for hover scrubbing.
-    """
-    asset_path = Path(asset_path)
-    asset_folder = asset_path.parent
-    asset_name = asset_path.stem
-    base_dir = asset_folder / "preview"
+    Return directory that contains preview frames for the asset.
 
-    # Main case: preview/<asset_name>/
-    d = base_dir / asset_name
+    Приоритет:
+      1) Глобальный корень превью: <LIB_ROOT>/preview/<rel>/<asset_name>/
+         где LIB_ROOT определяется эвристикой по пути (Z:\\_Library\\Something\\...).
+      2) Старый локальный layout: asset_folder/preview/<asset_name>/ (для обратной совместимости).
+    """
+    p = Path(asset_path)
+    asset_folder = p.parent
+    asset_name = p.stem
+
+    parts = p.parts
+    # Попробуем определить корень библиотеки вида Z:\_Library\Something
+    if len(parts) >= 3 and parts[1].lower() == "_library":
+        lib_root = Path(parts[0]) / parts[1] / parts[2]
+    elif len(parts) >= 2:
+        lib_root = Path(parts[0]) / parts[1]
+    else:
+        lib_root = p.parent
+
+    try:
+        rel = asset_folder.relative_to(lib_root)
+    except ValueError:
+        rel = Path(".")
+
+    preview_root = lib_root / "preview"
+
+    # Основной случай: preview/<rel>/<asset_name>/
+    d = preview_root / rel / asset_name
     if d.exists():
         return d
 
-    # Sequences: exp_0001 -> exp
+    # Секвенции: exp_0001 -> exp (preview/<rel>/exp/)
     name_no_frame = re.sub(r"_\d{4}$", "", asset_name)
     if name_no_frame != asset_name:
-        d = base_dir / name_no_frame
-        if d.exists():
-            return d
+        d2 = preview_root / rel / name_no_frame
+        if d2.exists():
+            return d2
+
+    # Fallback: старый локальный layout рядом с ассетом
+    base_dir = asset_folder / "preview"
+    d_local = base_dir / asset_name
+    if d_local.exists():
+        return d_local
+    if name_no_frame != asset_name:
+        d_local2 = base_dir / name_no_frame
+        if d_local2.exists():
+            return d_local2
 
     return None
 
@@ -156,12 +185,12 @@ class PreviewManager:
 
     def get_hover_frame(self, path: str, frame_index: int, icon_size: int) -> QPixmap | None:
         """
-        Return specific hover frame (0-31) for asset if it exists.
+        Return specific hover frame (0..N) for asset if it exists.
         Does not generate anything, only reads preview/<asset>/NNN.jpg.
         """
         if not path:
             return None
-        if frame_index < 0 or frame_index > 31:
+        if frame_index < 0:
             return None
 
         key = (path, frame_index)

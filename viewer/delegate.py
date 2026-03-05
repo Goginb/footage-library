@@ -35,18 +35,17 @@ class AssetDelegate(QStyledItemDelegate):
     def update_hover(self, index, x_ratio: float) -> None:
         """
         Update hover state based on mouse position over the tile.
-        x_ratio is in [0..1]; map it to frame index 0..31.
+        x_ratio is in [0..1]; map it to frame index 0..63 (NUM_FRAMES=64).
         """
         if not index.isValid():
             self.hover_index = None
             self.hover_frame = 0
             return
 
-        frame = int(x_ratio * 32)
+        frame = int(x_ratio * 64)
         if frame < 0:
             frame = 0
-        if frame > 31:
-            frame = 31
+        # upper bound is handled in PreviewManager.get_hover_frame
 
         self.hover_index = index
         self.hover_frame = frame

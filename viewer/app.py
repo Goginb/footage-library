@@ -209,6 +209,7 @@ class Viewer(QMainWindow):
         self._list.setMovement(QListView.Static)
         self._list.setSpacing(10)
         self._list.setWrapping(True)
+        self._list.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self._list.setUniformItemSizes(True)
         self._list.setIconSize(QSize(self.preview_size, self.preview_size))
         self._list.setGridSize(QSize(self.preview_size + 30, self.preview_size + 50))
@@ -480,9 +481,20 @@ class Viewer(QMainWindow):
         index = self._list.indexAt(pos)
         if not index.isValid():
             return
+
+        selected_indexes = self._list.selectedIndexes()
+        if not selected_indexes:
+            selected_indexes = [index]
+
         menu = QMenu(self)
         copy_path_action = menu.addAction("Copy Path")
         open_folder_action = menu.addAction("Open Folder")
+
+        # При мультивыборе отключаем действия, работающие только с одним элементом.
+        if len(selected_indexes) > 1:
+            copy_path_action.setEnabled(False)
+            open_folder_action.setEnabled(False)
+
         menu.addSeparator()
         change_category_action = menu.addAction("Change Category")
         global_pos = self._list.mapToGlobal(pos)
@@ -491,7 +503,8 @@ class Viewer(QMainWindow):
             return
 
         if action == copy_path_action:
-            metadata = self._model.data(index, Qt.UserRole) or {}
+            target_index = selected_indexes[0]
+            metadata = self._model.data(target_index, Qt.UserRole) or {}
             path = metadata.get("path")
             if not path:
                 return
@@ -502,7 +515,8 @@ class Viewer(QMainWindow):
             return
 
         if action == open_folder_action:
-            metadata = self._model.data(index, Qt.UserRole) or {}
+            target_index = selected_indexes[0]
+            metadata = self._model.data(target_index, Qt.UserRole) or {}
             path = metadata.get("path")
             if not path:
                 return
@@ -515,10 +529,26 @@ class Viewer(QMainWindow):
             self._change_category_for_item(index)
 
     def _change_category_for_item(self, index) -> None:
-        metadata = self._model.data(index, Qt.UserRole) or {}
-        footage_id = metadata.get("id")
-        if footage_id is None:
+        selected_indexes = self._list.selectedIndexes()
+        if not selected_indexes:
+            if not index or not index.isValid():
+                return
+            selected_indexes = [index]
+
+        footage_ids: list[int] = []
+        for idx in selected_indexes:
+            metadata = self._model.data(idx, Qt.UserRole) or {}
+            footage_id = metadata.get("id")
+            if footage_id is None:
+                continue
+            try:
+                footage_ids.append(int(footage_id))
+            except (TypeError, ValueError):
+                continue
+
+        if not footage_ids:
             return
+
         db = open_default_db()
         try:
             categories = db.get_all_categories()
@@ -534,7 +564,8 @@ class Viewer(QMainWindow):
             return
         db = open_default_db()
         try:
-            db.update_category_by_id(int(footage_id), new_category)
+            for fid in footage_ids:
+                db.update_category_by_id(fid, new_category)
         finally:
             db.close()
         self._populate_categories()
