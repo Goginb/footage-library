@@ -8,9 +8,17 @@ from typing import Dict, Iterable, List, Tuple
 
 from .db import FootageDatabase, FootageRecord, open_default_db
 
+try:
+    from generate_previews import generate_preview, get_thumb_path
+except ImportError:  # pragma: no cover - fallback for non-package execution
+    generate_preview = None  # type: ignore[assignment]
+    get_thumb_path = None  # type: ignore[assignment]
+
 
 SUPPORTED_EXTENSIONS = {".mov", ".mp4", ".exr", ".dpx", ".jpg", ".png"}
-IGNORE_FOLDERS = ["_trash", "backup", "temp", ".git", "__pycache__"]
+# preview — наша служебная папка с кадрами превью, её нужно игнорировать,
+# чтобы JPG-кадры не попадали в библиотеку как отдельные футажи.
+IGNORE_FOLDERS = ["preview", "_trash", "backup", "temp", ".git", "__pycache__"]
 
 SEQUENCE_REGEX = re.compile(r"^(?P<prefix>.*?)(?P<frame>\d{4})\.(?P<ext>exr|dpx)$", re.IGNORECASE)
 
@@ -26,6 +34,9 @@ AUTO_CATEGORY_RULES: Dict[str, str] = {
     "explosion": "Explosion",
     "explosions": "Explosion",
     "lightning": "Lightning",
+    # Any asset whose name or folder path contains "textures"
+    # will automatically get category "textures".
+    "textures": "textures",
 }
 
 
@@ -78,27 +89,37 @@ def scan_directory(root: Path) -> Iterable[FootageRecord]:
             asset_type = _compute_asset_type_for_single(ext)
 
             category = None
+            name_lower = filename.lower()
             for key, value in AUTO_CATEGORY_RULES.items():
-                if key in folder_lower:
+                if key in folder_lower or key in name_lower:
                     category = value
                     break
 
-            single_records.append(
-                FootageRecord(
-                    id=None,
-                    path=str(full_path),
-                    name=full_path.name,
-                    folder=str(folder_path),
-                    extension=ext,
-                    size=size,
-                    asset_type=asset_type,
-                    is_sequence=0,
-                    sequence_pattern=None,
-                    frame_start=None,
-                    frame_end=None,
-                    category=category,
-                )
+            record = FootageRecord(
+                id=None,
+                path=str(full_path),
+                name=full_path.name,
+                folder=str(folder_path),
+                extension=ext,
+                size=size,
+                asset_type=asset_type,
+                is_sequence=0,
+                sequence_pattern=None,
+                frame_start=None,
+                frame_end=None,
+                category=category,
             )
+
+            # Build thumbnails at index time (thumb_cache/<hash>/thumb.jpg).
+            if generate_preview is not None and get_thumb_path is not None:
+                path_str = str(full_path)
+                try:
+                    if not get_thumb_path(path_str).exists():
+                        generate_preview(path_str)
+                except Exception:
+                    pass
+
+            single_records.append(record)
 
         # Yield single (non-sequence) assets
         for record in single_records:
@@ -168,6 +189,11 @@ def run_indexer(folders: List[Path], db: FootageDatabase | None = None) -> None:
             new_count += len(records) - existing_batch
             total_count += len(records)
             db.insert_or_replace_many(records)
+            # Lightweight progress output so it's clear that indexing is running.
+            print(
+                f"[Indexer] scanned: {total_count} files "
+                f"(new: {new_count}, updated: {existing_count})"
+            )
 
         for folder in folders:
             for record in scan_directory(folder):

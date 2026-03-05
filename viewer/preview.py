@@ -1,21 +1,82 @@
+"""
+Viewer preview: read-only. Loads existing thumbnails only.
+First tries in-folder preview/<asset_name>/thumb.jpg, then thumb_cache/<hash>/thumb.jpg.
+Viewer NEVER generates previews; use build_previews.py or generate_previews.py.
+"""
 from __future__ import annotations
 
-from collections import OrderedDict, deque
 import hashlib
-import json
 import os
-import subprocess
-import time
+import re
 from pathlib import Path
+
 try:
-    from PySide6.QtGui import QPixmap
+    from PySide6.QtCore import Qt
+    from PySide6.QtGui import QImage, QPixmap
 except ImportError:
-    from PySide2.QtGui import QPixmap
+    from PySide2.QtCore import Qt
+    from PySide2.QtGui import QImage, QPixmap
 
-VIDEO_EXT = {".mov", ".mp4", ".mxf", ".avi"}
+
+def find_preview_for_asset(asset_path: str) -> str | None:
+    """
+    Resolve in-folder preview path: asset_folder/preview/<asset_name>/thumb.jpg.
+    For sequence paths (e.g. exp_0001.exr) also tries preview/<prefix>/thumb.jpg.
+    Returns path string if file exists, else None.
+    """
+    asset_path = Path(asset_path)
+    asset_folder = asset_path.parent
+    asset_name = asset_path.stem
+
+    base_dir = asset_folder / "preview"
+
+    # Prefer multi-frame layout 000.jpg (new builder).
+    preview_path = base_dir / asset_name / "000.jpg"
+    if preview_path.exists():
+        return str(preview_path)
+    # Backward-compatible: thumb.jpg layout.
+    legacy = base_dir / asset_name / "thumb.jpg"
+    if legacy.exists():
+        return str(legacy)
+
+    # Sequence: build_previews uses prefix (exp_0001 -> exp)
+    name_no_frame = re.sub(r"_\d{4}$", "", asset_name)
+    if name_no_frame != asset_name:
+        preview_path = base_dir / name_no_frame / "000.jpg"
+        if preview_path.exists():
+            return str(preview_path)
+        legacy = base_dir / name_no_frame / "thumb.jpg"
+        if legacy.exists():
+            return str(legacy)
+    return None
 
 
-def get_local_cache_root() -> Path:
+def get_preview_dir_for_asset(asset_path: str) -> Path | None:
+    """
+    Return directory preview/<asset_name>/ containing 000.jpg..031.jpg
+    (or legacy thumb.jpg). Used for hover scrubbing.
+    """
+    asset_path = Path(asset_path)
+    asset_folder = asset_path.parent
+    asset_name = asset_path.stem
+    base_dir = asset_folder / "preview"
+
+    # Main case: preview/<asset_name>/
+    d = base_dir / asset_name
+    if d.exists():
+        return d
+
+    # Sequences: exp_0001 -> exp
+    name_no_frame = re.sub(r"_\d{4}$", "", asset_name)
+    if name_no_frame != asset_name:
+        d = base_dir / name_no_frame
+        if d.exists():
+            return d
+
+    return None
+
+
+def get_thumb_cache_root() -> Path:
     local_appdata = os.getenv("LOCALAPPDATA")
     if not local_appdata:
         local_appdata = str(Path.home())
@@ -24,233 +85,108 @@ def get_local_cache_root() -> Path:
     return root
 
 
-SERVER_CACHE_ROOT = Path(r"\\server\vfx_library\thumb_cache")
-LOCAL_CACHE_ROOT = get_local_cache_root()
-INDEX_FILE = os.path.join(get_local_cache_root(), "index.json")
-preview_index: dict[str, dict] = {}
-
-
-def load_preview_index() -> None:
-    global preview_index
-    try:
-        if os.path.exists(INDEX_FILE):
-            with open(INDEX_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            preview_index = data if isinstance(data, dict) else {}
-        else:
-            preview_index = {}
-    except Exception:
-        preview_index = {}
-
-
-def save_preview_index() -> None:
-    try:
-        with open(INDEX_FILE, "w", encoding="utf-8") as f:
-            json.dump(preview_index, f, ensure_ascii=True)
-    except Exception:
-        pass
-
-
 def _asset_hash(asset_path: str) -> str:
     return hashlib.md5(asset_path.encode("utf-8")).hexdigest()
 
 
-def _update_index(asset_path: str, frame_count: int) -> None:
+def get_thumb_path(asset_path: str) -> Path:
+    """Path to thumb.jpg for this asset."""
     h = _asset_hash(asset_path)
-    preview_index[h] = {
-        "frames": int(frame_count),
-        "updated": time.time(),
-    }
-    save_preview_index()
+    return get_thumb_cache_root() / h / "thumb.jpg"
 
 
-def _has_jpg(cache_dir: Path) -> bool:
-    if not cache_dir.exists() or not cache_dir.is_dir():
-        return False
-    return any(cache_dir.glob("*.jpg"))
-
-
-def preview_exists(asset_path: str) -> bool:
-    h = _asset_hash(asset_path)
-    if h in preview_index:
-        return True
-
-    server_dir = SERVER_CACHE_ROOT / h
-    local_dir = LOCAL_CACHE_ROOT / h
-
-    if _has_jpg(server_dir):
-        frame_count = len(list(server_dir.glob("*.jpg")))
-        _update_index(asset_path, frame_count)
-        return True
-    if _has_jpg(local_dir):
-        frame_count = len(list(local_dir.glob("*.jpg")))
-        _update_index(asset_path, frame_count)
-        return True
-    return False
-
-
-def get_preview_cache_dir(asset_path: str) -> Path:
-    h = _asset_hash(asset_path)
-    server_dir = SERVER_CACHE_ROOT / h
-    local_dir = LOCAL_CACHE_ROOT / h
-
-    if _has_jpg(server_dir):
-        return server_dir
-    if _has_jpg(local_dir):
-        return local_dir
-    return local_dir
-
-
-def generate_video_preview(video_path: str) -> str | None:
-    cache_dir = get_preview_cache_dir(video_path)
-
-    frame_files = sorted(cache_dir.glob("*.jpg")) if cache_dir.exists() else []
-    if frame_files:
-        _update_index(video_path, len(frame_files))
-        first = cache_dir / "000.jpg"
-        return str(first if first.exists() else frame_files[0])
-
-    # No server/local jpg found: generate preview only in local cache.
-    h = _asset_hash(video_path)
-    local_cache_dir = LOCAL_CACHE_ROOT / h
-    local_cache_dir.mkdir(parents=True, exist_ok=True)
-    output_pattern = str(local_cache_dir / "%03d.jpg")
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        video_path,
-        "-vf",
-        "fps=1",
-        "-start_number",
-        "0",
-        "-frames:v",
-        "3",
-        output_pattern,
-    ]
-    try:
-        subprocess.run(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-    except Exception:
-        return None
-
-    first = local_cache_dir / "000.jpg"
-    if first.exists():
-        _update_index(video_path, len(list(local_cache_dir.glob("*.jpg"))))
-        return str(first)
-
-    frame_files = sorted(local_cache_dir.glob("*.jpg"))
-    if frame_files:
-        _update_index(video_path, len(frame_files))
-        return str(frame_files[0])
-    return None
-
-
-load_preview_index()
-
+# ---------------------------------------------------------------------------
+#  PreviewManager — RAM cache, load on demand. No queue, no ffmpeg.
+# ---------------------------------------------------------------------------
 
 class PreviewManager:
-    def __init__(self, thread_pool, start_task, is_cached, max_retry: int = 2) -> None:
-        self.thread_pool = thread_pool
-        self.start_task = start_task
-        self.is_cached = is_cached
-        self.max_retry = max_retry
-        self.queue = deque()
-        self.loading: set[str] = set()
-        self.retry_count: dict[str, int] = {}
-        self.pending_assets: dict[str, dict] = {}
-        self.thumbnail_cache = OrderedDict()
-        self.frames_cache = OrderedDict()
-        self.THUMB_CACHE_LIMIT = 200
-        self.FRAMES_CACHE_LIMIT = 80
+    def __init__(self) -> None:
+        self.cache: dict[str, QPixmap] = {}
+        self.hover_cache: dict[tuple[str, int], QPixmap] = {}
 
     def clear(self) -> None:
-        self.queue.clear()
-        self.loading.clear()
-        self.retry_count.clear()
-        self.pending_assets.clear()
-        self.thumbnail_cache.clear()
-        self.frames_cache.clear()
+        self.cache.clear()
+        self.hover_cache.clear()
 
-    def enqueue(self, asset) -> None:
-        path = asset.get("path") if isinstance(asset, dict) else None
+    def get_thumbnail(self, path: str, icon_size: int = 200) -> QPixmap | None:
+        """
+        Return pixmap for asset path. Load from disk if not in cache.
+        Tries in-folder preview/<asset_name>/thumb.jpg first, then thumb_cache/<hash>/thumb.jpg.
+        Viewer never generates; only loads existing jpg and caches.
+        """
         if not path:
-            return
-        if self.is_cached(path):
-            return
-        if path in self.loading:
-            return
-        if self.retry_count.get(path, 0) > self.max_retry:
-            return
+            return None
+        if path in self.cache:
+            pm = self.cache[path]
+            if pm.isNull():
+                return None
+            return pm
 
-        self.queue.append(asset)
-        self.pending_assets[path] = asset
-        self.loading.add(path)
-        self.process_queue()
+        # STEP 1–2: Prefer in-folder preview
+        preview_file = find_preview_for_asset(path)
+        if preview_file:
+            image = QImage(preview_file)
+            if not image.isNull():
+                pixmap = QPixmap.fromImage(image)
+                if not pixmap.isNull():
+                    scaled = pixmap.scaled(
+                        icon_size, icon_size,
+                        Qt.KeepAspectRatio, Qt.SmoothTransformation,
+                    )
+                    self.cache[path] = scaled
+                    return scaled
 
-    def process_queue(self) -> None:
-        while self.queue and self.thread_pool.activeThreadCount() < self.thread_pool.maxThreadCount():
-            asset = self.queue.popleft()
-            self.start_task(asset)
+        # STEP 3: Fallback to central cache thumb_cache/<hash>/thumb.jpg
+        thumb_path = get_thumb_path(path)
+        if not thumb_path.exists():
+            return None
 
-    def mark_loaded(self, path: str, success: bool) -> None:
+        image = QImage(str(thumb_path))
+        if image.isNull():
+            return None
+        pixmap = QPixmap.fromImage(image)
+        if pixmap.isNull():
+            return None
+        scaled = pixmap.scaled(
+            icon_size, icon_size,
+            Qt.KeepAspectRatio, Qt.SmoothTransformation,
+        )
+        self.cache[path] = scaled
+        return scaled
+
+    def get_hover_frame(self, path: str, frame_index: int, icon_size: int) -> QPixmap | None:
+        """
+        Return specific hover frame (0-31) for asset if it exists.
+        Does not generate anything, only reads preview/<asset>/NNN.jpg.
+        """
         if not path:
-            return
-        self.loading.discard(path)
+            return None
+        if frame_index < 0 or frame_index > 31:
+            return None
 
-        if success:
-            self.retry_count.pop(path, None)
-            self.pending_assets.pop(path, None)
-        else:
-            attempt = self.retry_count.get(path, 0) + 1
-            self.retry_count[path] = attempt
-            if attempt <= self.max_retry and path in self.pending_assets:
-                self.queue.append(self.pending_assets[path])
-                self.loading.add(path)
-            else:
-                self.pending_assets.pop(path, None)
-        self.process_queue()
+        key = (path, frame_index)
+        if key in self.hover_cache:
+            pm = self.hover_cache[key]
+            return None if pm.isNull() else pm
 
-    def set_thumbnail(self, path: str, pixmap: QPixmap) -> None:
-        if not path or pixmap.isNull():
-            return
-        if path in self.thumbnail_cache:
-            self.thumbnail_cache.pop(path)
-        self.thumbnail_cache[path] = pixmap
-        if len(self.thumbnail_cache) > self.THUMB_CACHE_LIMIT:
-            self.thumbnail_cache.popitem(last=False)
+        preview_dir = get_preview_dir_for_asset(path)
+        if preview_dir is None:
+            return None
 
-    def get_thumbnail(self, path: str) -> QPixmap | None:
-        return self.thumbnail_cache.get(path)
+        frame_file = preview_dir / f"{frame_index:03d}.jpg"
+        if not frame_file.exists():
+            return None
 
-    def get_frames(self, path: str) -> list[QPixmap]:
-        if not path:
-            return []
-        cached = self.frames_cache.get(path)
-        if cached is not None:
-            self.frames_cache.pop(path)
-            self.frames_cache[path] = cached
-            return cached
+        image = QImage(str(frame_file))
+        if image.isNull():
+            return None
+        pixmap = QPixmap.fromImage(image)
+        if pixmap.isNull():
+            return None
 
-        cache_dir = get_preview_cache_dir(path)
-        frame_files = sorted(cache_dir.glob("*.jpg"))[:12]
-        frames: list[QPixmap] = []
-        for frame_file in frame_files:
-            pm = QPixmap(str(frame_file))
-            if not pm.isNull():
-                frames.append(pm)
-
-        if path in self.frames_cache:
-            self.frames_cache.pop(path)
-        self.frames_cache[path] = frames
-        if len(self.frames_cache) > self.FRAMES_CACHE_LIMIT:
-            self.frames_cache.popitem(last=False)
-        if frames and path not in self.thumbnail_cache:
-            self.thumbnail_cache[path] = frames[0]
-            if len(self.thumbnail_cache) > self.THUMB_CACHE_LIMIT:
-                self.thumbnail_cache.popitem(last=False)
-        return frames
+        scaled = pixmap.scaled(
+            icon_size, icon_size,
+            Qt.KeepAspectRatio, Qt.SmoothTransformation,
+        )
+        self.hover_cache[key] = scaled
+        return scaled
